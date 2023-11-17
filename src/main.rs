@@ -1,6 +1,7 @@
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 #[derive(Clone, Debug)]
@@ -9,7 +10,7 @@ enum Event {
 }
 
 async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
+    mut stream: TcpStream,
     socket_addr: SocketAddr,
     sender: broadcast::Sender<Event>,
     mut receiver: broadcast::Receiver<Event>,
@@ -50,28 +51,26 @@ async fn handle_connection(
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let listener = TcpListener::bind("127.0.0.1:3000").unwrap();
-    tracing::info!("Listening on {}", listener.local_addr().unwrap());
-
-    let (s, r) = std::sync::mpsc::channel::<(TcpStream, SocketAddr)>();
-
     // Thread to accept connections and push to channel
-    std::thread::spawn(move || loop {
-        match listener.accept() {
-            Ok(conn) => s.send(conn).unwrap(),
-            Err(err) => tracing::error!("{}", err),
-        };
+    let handle = std::thread::spawn(|| async {
+        let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
+        tracing::info!("Listening on {}", listener.local_addr().unwrap());
+        let tokio_rt = tokio::runtime::Handle::current();
+        let (sender, _) = broadcast::channel::<Event>(10);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    let sender = sender.clone();
+                    let receiver = sender.subscribe();
+                    tokio_rt.spawn(async move {
+                        handle_connection(stream, addr, sender, receiver).await
+                    });
+                }
+                Err(err) => tracing::error!("{}", err),
+            };
+        }
     });
 
-    let tokio_rt = tokio::runtime::Handle::current();
-    let (sender, _) = broadcast::channel::<Event>(10);
-
-    // Infinite loop to spawn tokio tasks from the receiving end of the channel
-    for (stream, addr) in r {
-        stream.set_nonblocking(true).unwrap();
-        let stream = tokio::net::TcpStream::from_std(stream).unwrap();
-        let sender = sender.clone();
-        let receiver = sender.subscribe();
-        tokio_rt.spawn(async move { handle_connection(stream, addr, sender, receiver).await });
-    }
+    handle.join().unwrap().await;
 }
